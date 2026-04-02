@@ -124,15 +124,17 @@ impl ModifierStore for RedbModifierStore {
             let mut table = write_txn.open_table(PRIMARY)?;
             let _ = table.insert((type_id, *id), data)?;
         }
-        {
+        if height > 0 {
             let mut table = write_txn.open_table(HEIGHT_INDEX)?;
             let _ = table.insert((type_id, height), *id)?;
         }
         write_txn.commit()?;
 
-        let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
-        if tips.get(&type_id).is_none_or(|tip| height > tip.0) {
-            tips.insert(type_id, (height, *id));
+        if height > 0 {
+            let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
+            if tips.get(&type_id).is_none_or(|tip| height > tip.0) {
+                tips.insert(type_id, (height, *id));
+            }
         }
         Ok(())
     }
@@ -147,14 +149,16 @@ impl ModifierStore for RedbModifierStore {
             let mut height_idx = write_txn.open_table(HEIGHT_INDEX)?;
             for (type_id, id, height, data) in entries {
                 let _ = primary.insert((*type_id, *id), data.as_slice())?;
-                let _ = height_idx.insert((*type_id, *height), *id)?;
+                if *height > 0 {
+                    let _ = height_idx.insert((*type_id, *height), *id)?;
+                }
             }
         }
         write_txn.commit()?;
 
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         for (type_id, id, height, _) in entries {
-            if tips.get(type_id).is_none_or(|tip| *height > tip.0) {
+            if *height > 0 && tips.get(type_id).is_none_or(|tip| *height > tip.0) {
                 tips.insert(*type_id, (*height, *id));
             }
         }
@@ -302,6 +306,29 @@ mod tests {
         store.put(101, &id, 1, data).unwrap();
         store.put(101, &id, 1, data).unwrap();
         assert_eq!(store.get(101, &id).unwrap(), Some(data.to_vec()));
+    }
+
+    #[test]
+    fn height_zero_skips_index_and_tip() {
+        let (store, _dir) = test_store();
+        let id = test_id(1);
+
+        // Put with real height — establishes height index and tip
+        store.put(101, &id, 5, b"original").unwrap();
+        assert_eq!(store.get_id_at(101, 5).unwrap(), Some(id));
+        assert_eq!(store.tip(101).unwrap(), Some((5, id)));
+
+        // Re-put same (type_id, id) with height=0 and new data
+        store.put(101, &id, 0, b"updated").unwrap();
+
+        // Primary data updated
+        assert_eq!(store.get(101, &id).unwrap(), Some(b"updated".to_vec()));
+        // Height index not clobbered
+        assert_eq!(store.get_id_at(101, 5).unwrap(), Some(id));
+        // No spurious entry at height 0
+        assert_eq!(store.get_id_at(101, 0).unwrap(), None);
+        // Tip unchanged
+        assert_eq!(store.tip(101).unwrap(), Some((5, id)));
     }
 
     #[test]
