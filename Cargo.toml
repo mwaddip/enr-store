@@ -5,7 +5,7 @@ edition = "2021"
 description = "Persistent modifier storage for ergo-node-rust"
 
 [dependencies]
-redb = "3.1"
+redb = "4"
 
 [dev-dependencies]
 tempfile = "3"
