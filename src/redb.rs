@@ -210,49 +210,83 @@ impl ModifierStore for RedbModifierStore {
         height: u32,
         data: &[u8],
     ) -> Result<(), Self::Error> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(PRIMARY)?;
-            let _ = table.insert((type_id, *id), data)?;
-        }
-        if height > 0 {
-            let mut table = write_txn.open_table(HEIGHT_INDEX)?;
-            let _ = table.insert((type_id, height), *id)?;
-        }
-        write_txn.commit()?;
-
-        if height > 0 {
-            let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
-            if tips.get(&type_id).is_none_or(|tip| height > tip.0) {
-                tips.insert(type_id, (height, *id));
-            }
-        }
-        Ok(())
+        // Single-entry put is just put_batch with one entry; route through
+        // the same code path so type_id=101 lands in the fork-aware tables.
+        self.put_batch(&[(type_id, *id, height, data.to_vec())])
     }
 
+    /// Stores a batch of modifiers atomically.
+    ///
+    /// For type_id == 101 (header) entries, writes to the fork-aware tables
+    /// (PRIMARY + HEADER_FORKS + HEADER_SCORES + BEST_CHAIN) instead of
+    /// HEIGHT_INDEX. The caller is expected to only put_batch headers that
+    /// belong on the best chain (e.g., AppendResult::Extended in pipeline.rs);
+    /// fork headers must go through put_header, which respects existing
+    /// best-chain entries.
+    ///
+    /// BEST_CHAIN inserts for headers are unconditional: main-chain headers
+    /// authoritatively own their height slot and will overwrite a stale
+    /// entry left by an earlier fork-first arrival or a deep reorg.
     fn put_batch(
         &self,
         entries: &[(u8, [u8; 32], u32, Vec<u8>)],
     ) -> Result<(), Self::Error> {
         let write_txn = self.db.begin_write()?;
+        let mut new_best_tip: Option<(u32, [u8; 32])> = None;
         {
             let mut primary = write_txn.open_table(PRIMARY)?;
             let mut height_idx = write_txn.open_table(HEIGHT_INDEX)?;
+            let mut forks = write_txn.open_table(HEADER_FORKS)?;
+            let mut scores = write_txn.open_table(HEADER_SCORES)?;
+            let mut best = write_txn.open_table(BEST_CHAIN)?;
+
             for (type_id, id, height, data) in entries {
-                let _ = primary.insert((*type_id, *id), data.as_slice())?;
-                if *height > 0 {
-                    let _ = height_idx.insert((*type_id, *height), *id)?;
+                primary.insert((*type_id, *id), data.as_slice())?;
+
+                if *type_id == 101 && *height > 0 {
+                    // Header — fork-aware tables. HEIGHT_INDEX is the legacy
+                    // schema and is intentionally NOT written for type_id=101.
+                    // height==0 means "height unknown" — only update PRIMARY,
+                    // matching the long-standing put/put_batch contract.
+                    forks.insert((*height, 0u32), *id)?;
+                    // Empty score placeholder. Real cumulative-difficulty
+                    // scores are only computed for fork headers in pipeline;
+                    // main-chain header scores live in the in-memory chain
+                    // and are not currently persisted alongside the header.
+                    scores.insert(*id, [].as_slice())?;
+                    // Unconditional insert: main-chain is authoritative and
+                    // overwrites any stale fork or reorged entry at this height.
+                    best.insert(*height, *id)?;
+                    if new_best_tip.is_none_or(|t| *height > t.0) {
+                        new_best_tip = Some((*height, *id));
+                    }
+                } else if *type_id != 101 && *height > 0 {
+                    height_idx.insert((*type_id, *height), *id)?;
                 }
             }
         }
         write_txn.commit()?;
 
+        // Update non-header tips cache (HEIGHT_INDEX-backed).
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         for (type_id, id, height, _) in entries {
-            if *height > 0 && tips.get(type_id).is_none_or(|tip| *height > tip.0) {
+            if *type_id != 101
+                && *height > 0
+                && tips.get(type_id).is_none_or(|tip| *height > tip.0)
+            {
                 tips.insert(*type_id, (*height, *id));
             }
         }
+        drop(tips);
+
+        // Update best-header tip cache.
+        if let Some(new_tip) = new_best_tip {
+            let mut tip = self.best_header_tip.write().unwrap_or_else(|e| e.into_inner());
+            if tip.is_none_or(|t| new_tip.0 > t.0) {
+                *tip = Some(new_tip);
+            }
+        }
+
         Ok(())
     }
 
@@ -276,6 +310,12 @@ impl ModifierStore for RedbModifierStore {
         type_id: u8,
         height: u32,
     ) -> Result<Option<[u8; 32]>, Self::Error> {
+        // Headers (type_id=101) are looked up via BEST_CHAIN, not HEIGHT_INDEX.
+        // HEIGHT_INDEX is the legacy schema for headers and is cleared by
+        // migration on first open.
+        if type_id == 101 {
+            return self.best_header_at(height);
+        }
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(HEIGHT_INDEX) {
             Ok(t) => t,
@@ -304,6 +344,12 @@ impl ModifierStore for RedbModifierStore {
         &self,
         type_id: u8,
     ) -> Result<Option<(u32, [u8; 32])>, Self::Error> {
+        // Headers (type_id=101) live in the fork-aware tables; their tip is
+        // tracked separately. Route the lookup so the documented contract
+        // ("highest stored modifier of this type") holds for headers too.
+        if type_id == 101 {
+            return self.best_header_tip();
+        }
         let tips = self.tips.read().unwrap_or_else(|e| e.into_inner());
         Ok(tips.get(&type_id).copied())
     }
@@ -741,6 +787,187 @@ mod tests {
         assert_eq!(store.best_header_tip().unwrap(), Some((11, id_b)));
     }
 
+    // --- Diagnostic tests for the BEST_CHAIN gap bug ---
+
+    #[test]
+    fn put_batch_populates_best_chain_for_headers() {
+        // pipeline.rs writes main-chain headers (type_id=101) via put_batch.
+        // For BEST_CHAIN to track the chain tip, put_batch must persist them
+        // to the fork-aware tables, not just PRIMARY/HEIGHT_INDEX.
+        let (store, _dir) = test_store();
+        let id = test_id(1);
+
+        store.put_batch(&[(101, id, 100, b"header".to_vec())]).unwrap();
+
+        // PRIMARY populated
+        assert_eq!(store.get(101, &id).unwrap(), Some(b"header".to_vec()));
+        // BEST_CHAIN populated
+        assert_eq!(store.best_header_at(100).unwrap(), Some(id));
+        // HEADER_FORKS populated (fork=0)
+        assert_eq!(store.header_ids_at_height(100).unwrap(), vec![(id, 0)]);
+        // best_header_tip cache updated
+        assert_eq!(store.best_header_tip().unwrap(), Some((100, id)));
+    }
+
+    #[test]
+    fn happy_path_sync_no_forks_grows_best_chain_across_restarts() {
+        // Simulates what the test server does on a clean sync with no forks:
+        // each "session" writes some main-chain headers via put_batch and is
+        // restarted. After every restart, BEST_CHAIN should be dense from 1
+        // up to the latest height ever written.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("happy.redb");
+
+        // Session 1: heights 1..=100
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (1..=100u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+                .collect();
+            store.put_batch(&entries).unwrap();
+        }
+
+        // Session 2: restart, write heights 101..=200
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            assert_eq!(
+                store.best_header_tip().unwrap(),
+                Some((100, test_id(100))),
+                "after session 1, tip should be 100"
+            );
+            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (101..=200u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+                .collect();
+            store.put_batch(&entries).unwrap();
+        }
+
+        // Session 3: restart, verify BEST_CHAIN is dense 1..=200
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            assert_eq!(
+                store.best_header_tip().unwrap(),
+                Some((200, test_id(200))),
+                "after session 2, tip should be 200"
+            );
+            for h in 1..=200u32 {
+                assert_eq!(
+                    store.best_header_at(h).unwrap(),
+                    Some(test_id(h as u8)),
+                    "BEST_CHAIN missing entry at height {h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn put_batch_grows_best_chain_after_fork_arrives() {
+        // Regression for the original write-path bug: in the broken code,
+        // a single fork header populated HEADER_FORKS, which made the
+        // migration's "already migrated?" guard trip. Subsequent main-chain
+        // headers landed by put_batch were stranded in HEIGHT_INDEX and
+        // never reached BEST_CHAIN, freezing best_header_tip.
+        //
+        // After the fix, put_batch writes type_id=101 entries directly to
+        // the fork-aware tables, so the migration is irrelevant for new
+        // entries and BEST_CHAIN keeps tracking the chain tip even when
+        // forks are interleaved with main-chain growth.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("forked.redb");
+
+        // Phase 1: fresh start, sync 100 main-chain headers via put_batch.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (1..=100u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+                .collect();
+            store.put_batch(&entries).unwrap();
+        }
+
+        // Phase 2: restart, fork header arrives, then more main-chain via put_batch.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            assert_eq!(store.best_header_tip().unwrap(), Some((100, test_id(100))));
+
+            // A fork header arrives at height 50 (a height that already has
+            // a main-chain header). put_header with fork>0 must NOT overwrite
+            // the existing best entry.
+            let fork_id = test_id(0xF1);
+            store.put_header(&fork_id, 50, 1, &[0x99], b"fork").unwrap();
+            assert_eq!(
+                store.best_header_at(50).unwrap(),
+                Some(test_id(50)),
+                "fork at existing height must not displace main-chain entry"
+            );
+
+            // More main-chain headers arrive via put_batch.
+            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (101..=200u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+                .collect();
+            store.put_batch(&entries).unwrap();
+        }
+
+        // Phase 3: restart, verify the new heights reached BEST_CHAIN.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            assert_eq!(
+                store.best_header_tip().unwrap(),
+                Some((200, test_id(200))),
+                "BEST_CHAIN must track put_batch headers across restarts even \
+                 after a fork header populated HEADER_FORKS"
+            );
+            for h in 1..=200u32 {
+                assert_eq!(
+                    store.best_header_at(h).unwrap(),
+                    Some(test_id(h as u8)),
+                    "BEST_CHAIN missing entry at height {h}"
+                );
+            }
+            // The fork header is still queryable via header_ids_at_height.
+            let ids = store.header_ids_at_height(50).unwrap();
+            assert!(
+                ids.iter().any(|(_, fork)| *fork == 1),
+                "fork header should still be in HEADER_FORKS at fork=1"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_first_then_main_chain_leaves_best_chain_empty_at_height() {
+        // The "fork-first arrival" scenario from the prompt: a fork header
+        // arrives at height H before the main-chain header at H is persisted.
+        // put_header with fork>0 hits the `if best.get(height)?.is_none()` guard
+        // and inserts the fork as the BEST_CHAIN entry at H. Later when the
+        // main-chain header at H lands via put_batch, BEST_CHAIN is not touched
+        // (put_batch doesn't write BEST_CHAIN), and the height is left wired to
+        // the fork header — or, if the fork hadn't arrived first, left empty
+        // entirely.
+        //
+        // This also reproduces a single-height gap: if put_header is called
+        // for a fork at height H+1 with fork>0 BEFORE put_batch lands the
+        // main-chain headers at H and H+1, the guard prevents the fork from
+        // overwriting any existing entry (none exists), so BEST_CHAIN[H+1] ==
+        // fork_id but BEST_CHAIN[H] == None.
+        let (store, _dir) = test_store();
+
+        // Main-chain header at height 100 lands via put_batch (no BEST_CHAIN).
+        let main_100 = test_id(100);
+        store.put_batch(&[(101, main_100, 100, b"main100".to_vec())]).unwrap();
+
+        // Fork header at height 100 arrives via put_header. The guard says
+        // "BEST_CHAIN[100] is empty, so insert me." Now BEST_CHAIN[100] points
+        // at the FORK header, not the main-chain header.
+        let fork_100 = test_id(0xF0);
+        store.put_header(&fork_100, 100, 1, &[0x99], b"fork100").unwrap();
+
+        // The main-chain header is the rightful occupant of best_header_at(100).
+        let best = store.best_header_at(100).unwrap();
+        assert_eq!(
+            best,
+            Some(main_100),
+            "best_header_at(100) should be the main-chain header, not the fork"
+        );
+    }
+
     #[test]
     fn migration_from_height_index() {
         let dir = TempDir::new().unwrap();
@@ -783,10 +1010,25 @@ mod tests {
         // best_header_tip is height 3
         assert_eq!(store.best_header_tip().unwrap(), Some((3, test_id(3))));
 
-        // Old (101, *) entries removed from HEIGHT_INDEX
-        assert_eq!(store.get_id_at(101, 1).unwrap(), None);
-        assert_eq!(store.get_id_at(101, 2).unwrap(), None);
-        assert_eq!(store.get_id_at(101, 3).unwrap(), None);
+        // After migration, headers are looked up via the fork-aware path.
+        // get_id_at(101, h) now routes through BEST_CHAIN, so it returns the
+        // migrated header — same value as best_header_at(h).
+        for h in 1..=3u32 {
+            assert_eq!(store.get_id_at(101, h).unwrap(), Some(test_id(h as u8)));
+        }
+
+        // The legacy HEIGHT_INDEX entries themselves are gone — verify by
+        // direct table access so we don't depend on get_id_at's routing.
+        {
+            let read_txn = store.db.begin_read().unwrap();
+            let height_idx = read_txn.open_table(HEIGHT_INDEX).unwrap();
+            for h in 1..=3u32 {
+                assert!(
+                    height_idx.get((101u8, h)).unwrap().is_none(),
+                    "legacy (101, {h}) entry should be removed from HEIGHT_INDEX"
+                );
+            }
+        }
 
         // Non-header entry (type 102) untouched
         assert_eq!(store.get_id_at(102, 1).unwrap(), Some(test_id(0xFF)));
