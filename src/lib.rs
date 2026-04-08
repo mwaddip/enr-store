@@ -67,13 +67,6 @@ pub trait ModifierStore: Send + Sync {
         data: &[u8],
     ) -> Result<(), Self::Error>;
 
-    /// Batch version of put_header. All entries written atomically.
-    fn put_header_batch(
-        &self,
-        entries: &[([u8; 32], u32, u32, Vec<u8>, Vec<u8>)],
-        // (id, height, fork, score, data)
-    ) -> Result<(), Self::Error>;
-
     /// Get all header IDs at a given height across all forks.
     /// Returns Vec<(header_id, fork_number)> sorted by fork number.
     fn header_ids_at_height(
@@ -95,12 +88,4 @@ pub trait ModifierStore: Send + Sync {
 
     /// Get the best chain tip (highest height and header ID).
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
-
-    /// Atomically switch the best chain: remove old entries, insert new ones.
-    /// Updates the best_header_tip cache.
-    fn switch_best_chain(
-        &self,
-        demote: &[u32],
-        promote: &[(u32, [u8; 32])],
-    ) -> Result<(), Self::Error>;
 }

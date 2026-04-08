@@ -18,11 +18,11 @@ Key method groups:
 | Group | Methods |
 |-------|---------|
 | Generic modifiers | `put`, `put_batch`, `get`, `get_id_at`, `contains`, `tip` |
-| Fork-aware headers | `put_header`, `put_header_batch`, `header_ids_at_height`, `header_score`, `best_header_at`, `best_header_tip`, `switch_best_chain` |
+| Fork-aware headers | `put_header`, `header_ids_at_height`, `header_score`, `best_header_at`, `best_header_tip` |
 
 ## Header writes go through the fork-aware tables
 
-Headers are `type_id == 101`. Whether you call the generic `put` / `put_batch` API or the explicit `put_header` / `put_header_batch` API, the bytes land in the same place:
+Headers are `type_id == 101`. Whether you call the generic `put` / `put_batch` API or the explicit `put_header` API, the bytes land in the same place:
 
 | Caller intent | Methods | Tables written |
 |---|---|---|

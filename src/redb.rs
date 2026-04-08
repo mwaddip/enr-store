@@ -394,44 +394,6 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn put_header_batch(
-        &self,
-        entries: &[([u8; 32], u32, u32, Vec<u8>, Vec<u8>)],
-    ) -> Result<(), Self::Error> {
-        let write_txn = self.db.begin_write()?;
-        let mut new_best_tip: Option<(u32, [u8; 32])> = None;
-        {
-            let mut primary = write_txn.open_table(PRIMARY)?;
-            let mut forks = write_txn.open_table(HEADER_FORKS)?;
-            let mut scores = write_txn.open_table(HEADER_SCORES)?;
-            let mut best = write_txn.open_table(BEST_CHAIN)?;
-
-            for (id, height, fork, score, data) in entries {
-                primary.insert((101u8, *id), data.as_slice())?;
-                forks.insert((*height, *fork), *id)?;
-                scores.insert(*id, score.as_slice())?;
-
-                if best.get(*height)?.is_none() {
-                    best.insert(*height, *id)?;
-                    if new_best_tip.is_none_or(|t| *height > t.0) {
-                        new_best_tip = Some((*height, *id));
-                    }
-                }
-            }
-        }
-        write_txn.commit()?;
-
-        // Update cache with highest new best entry.
-        if let Some(new_tip) = new_best_tip {
-            let mut tip = self.best_header_tip.write().unwrap_or_else(|e| e.into_inner());
-            if tip.is_none_or(|t| new_tip.0 > t.0) {
-                *tip = Some(new_tip);
-            }
-        }
-
-        Ok(())
-    }
-
     fn header_ids_at_height(
         &self,
         height: u32,
@@ -484,33 +446,6 @@ impl ModifierStore for RedbModifierStore {
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error> {
         let tip = self.best_header_tip.read().unwrap_or_else(|e| e.into_inner());
         Ok(*tip)
-    }
-
-    fn switch_best_chain(
-        &self,
-        demote: &[u32],
-        promote: &[(u32, [u8; 32])],
-    ) -> Result<(), Self::Error> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut best = write_txn.open_table(BEST_CHAIN)?;
-            for height in demote {
-                best.remove(*height)?;
-            }
-            for (height, id) in promote {
-                best.insert(*height, *id)?;
-            }
-        }
-        write_txn.commit()?;
-
-        // Update cache to highest promoted height.
-        let new_tip = promote.iter().max_by_key(|(h, _)| *h).copied();
-        if let Some(new_tip) = new_tip {
-            let mut tip = self.best_header_tip.write().unwrap_or_else(|e| e.into_inner());
-            *tip = Some(new_tip);
-        }
-
-        Ok(())
     }
 }
 
@@ -692,99 +627,6 @@ mod tests {
         // Both readable from PRIMARY
         assert_eq!(store.get(101, &id_a).unwrap(), Some(b"fork0".to_vec()));
         assert_eq!(store.get(101, &id_b).unwrap(), Some(b"fork1".to_vec()));
-    }
-
-    #[test]
-    fn switch_best_chain_single_height() {
-        let (store, _dir) = test_store();
-        let id_a = test_id(0xAA);
-        let id_b = test_id(0xBB);
-
-        store.put_header(&id_a, 10, 0, &[0x01], b"a").unwrap();
-        store.put_header(&id_b, 10, 1, &[0x02], b"b").unwrap();
-
-        // Currently best at height 10 is id_a
-        assert_eq!(store.best_header_at(10).unwrap(), Some(id_a));
-
-        // Switch: demote height 10, promote id_b at height 10
-        store.switch_best_chain(&[10], &[(10, id_b)]).unwrap();
-
-        assert_eq!(store.best_header_at(10).unwrap(), Some(id_b));
-        assert_eq!(store.best_header_tip().unwrap(), Some((10, id_b)));
-    }
-
-    #[test]
-    fn switch_best_chain_multi_height() {
-        let (store, _dir) = test_store();
-
-        // Build a best chain of 5 headers at heights 1..=5
-        for h in 1..=5u32 {
-            let id = test_id(h as u8);
-            store.put_header(&id, h, 0, &[h as u8], b"best").unwrap();
-        }
-        assert_eq!(store.best_header_tip().unwrap(), Some((5, test_id(5))));
-
-        // Fork headers at heights 3..=6 (fork is longer)
-        let fork_ids: Vec<[u8; 32]> = (3..=6u32).map(|h| {
-            let id = test_id(0xF0 + h as u8);
-            store.put_header(&id, h, 1, &[0xF0 + h as u8], b"fork").unwrap();
-            id
-        }).collect();
-
-        // Demote heights 3, 4, 5 — promote fork at 3, 4, 5, 6
-        store.switch_best_chain(
-            &[3, 4, 5],
-            &[
-                (3, fork_ids[0]),
-                (4, fork_ids[1]),
-                (5, fork_ids[2]),
-                (6, fork_ids[3]),
-            ],
-        ).unwrap();
-
-        // Heights 1-2 unchanged
-        assert_eq!(store.best_header_at(1).unwrap(), Some(test_id(1)));
-        assert_eq!(store.best_header_at(2).unwrap(), Some(test_id(2)));
-        // Heights 3-6 switched
-        assert_eq!(store.best_header_at(3).unwrap(), Some(fork_ids[0]));
-        assert_eq!(store.best_header_at(4).unwrap(), Some(fork_ids[1]));
-        assert_eq!(store.best_header_at(5).unwrap(), Some(fork_ids[2]));
-        assert_eq!(store.best_header_at(6).unwrap(), Some(fork_ids[3]));
-        // Tip is now height 6
-        assert_eq!(store.best_header_tip().unwrap(), Some((6, fork_ids[3])));
-    }
-
-    #[test]
-    fn put_header_batch_works() {
-        let (store, _dir) = test_store();
-        let id_a = test_id(0xAA);
-        let id_b = test_id(0xBB);
-
-        let entries = vec![
-            (id_a, 10, 0, vec![0x01], b"header_a".to_vec()),
-            (id_b, 11, 0, vec![0x02], b"header_b".to_vec()),
-        ];
-
-        store.put_header_batch(&entries).unwrap();
-
-        // Both in PRIMARY
-        assert_eq!(store.get(101, &id_a).unwrap(), Some(b"header_a".to_vec()));
-        assert_eq!(store.get(101, &id_b).unwrap(), Some(b"header_b".to_vec()));
-
-        // Both in HEADER_FORKS
-        assert_eq!(store.header_ids_at_height(10).unwrap(), vec![(id_a, 0)]);
-        assert_eq!(store.header_ids_at_height(11).unwrap(), vec![(id_b, 0)]);
-
-        // Both in HEADER_SCORES
-        assert_eq!(store.header_score(&id_a).unwrap(), Some(vec![0x01]));
-        assert_eq!(store.header_score(&id_b).unwrap(), Some(vec![0x02]));
-
-        // Both in BEST_CHAIN
-        assert_eq!(store.best_header_at(10).unwrap(), Some(id_a));
-        assert_eq!(store.best_header_at(11).unwrap(), Some(id_b));
-
-        // Tip is the higher one
-        assert_eq!(store.best_header_tip().unwrap(), Some((11, id_b)));
     }
 
     // --- Diagnostic tests for the BEST_CHAIN gap bug ---
