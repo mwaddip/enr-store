@@ -2,7 +2,7 @@ use crate::ModifierStore;
 use ::redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> = TableDefinition::new("primary");
 const HEIGHT_INDEX: TableDefinition<(u8, u32), [u8; 32]> = TableDefinition::new("height_index");
@@ -192,7 +192,7 @@ impl RedbModifierStore {
 
         // Update cache.
         if let Some((height, id)) = entries.last() {
-            let mut tip = self.best_header_tip.write().unwrap_or_else(|e| e.into_inner());
+            let mut tip = self.best_header_tip.write();
             *tip = Some((*height, *id));
         }
 
@@ -268,7 +268,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn.commit()?;
 
         // Update non-header tips cache (HEIGHT_INDEX-backed).
-        let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
+        let mut tips = self.tips.write();
         for (type_id, id, height, _) in entries {
             if *type_id != 101
                 && *height > 0
@@ -281,7 +281,7 @@ impl ModifierStore for RedbModifierStore {
 
         // Update best-header tip cache.
         if let Some(new_tip) = new_best_tip {
-            let mut tip = self.best_header_tip.write().unwrap_or_else(|e| e.into_inner());
+            let mut tip = self.best_header_tip.write();
             if tip.is_none_or(|t| new_tip.0 > t.0) {
                 *tip = Some(new_tip);
             }
@@ -350,7 +350,7 @@ impl ModifierStore for RedbModifierStore {
         if type_id == 101 {
             return self.best_header_tip();
         }
-        let tips = self.tips.read().unwrap_or_else(|e| e.into_inner());
+        let tips = self.tips.read();
         Ok(tips.get(&type_id).copied())
     }
 
@@ -385,7 +385,7 @@ impl ModifierStore for RedbModifierStore {
         // means fork==0 is the first arrival. For fork>0 the height already had
         // an entry so we skipped the BEST_CHAIN insert.
         if fork == 0 {
-            let mut tip = self.best_header_tip.write().unwrap_or_else(|e| e.into_inner());
+            let mut tip = self.best_header_tip.write();
             if tip.is_none_or(|t| height > t.0) {
                 *tip = Some((height, *id));
             }
@@ -444,7 +444,7 @@ impl ModifierStore for RedbModifierStore {
     }
 
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error> {
-        let tip = self.best_header_tip.read().unwrap_or_else(|e| e.into_inner());
+        let tip = self.best_header_tip.read();
         Ok(*tip)
     }
 }

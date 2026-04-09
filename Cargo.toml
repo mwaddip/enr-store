@@ -5,6 +5,7 @@ edition = "2021"
 description = "Persistent modifier storage for ergo-node-rust"
 
 [dependencies]
+parking_lot = "0.12"
 redb = "4"
 
 [dev-dependencies]
