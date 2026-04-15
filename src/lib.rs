@@ -88,4 +88,16 @@ pub trait ModifierStore: Send + Sync {
 
     /// Get the best chain tip (highest height and header ID).
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
+
+    /// Read the stored header bytes at a best-chain height.
+    ///
+    /// Equivalent to `best_header_at(h)` followed by `get(101, &id)`, but
+    /// served from a single read transaction. Returns `Ok(None)` when no
+    /// best-chain header is recorded at `height`. The returned bytes are
+    /// the caller-provided `data` passed to `put` / `put_batch` /
+    /// `put_header`; this method does not parse them.
+    fn read_header_at(
+        &self,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
 }

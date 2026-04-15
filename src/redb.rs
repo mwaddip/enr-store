@@ -447,6 +447,30 @@ impl ModifierStore for RedbModifierStore {
         let tip = self.best_header_tip.read();
         Ok(*tip)
     }
+
+    fn read_header_at(
+        &self,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        let read_txn = self.db.begin_read()?;
+
+        let best_chain = match read_txn.open_table(BEST_CHAIN) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        let id = match best_chain.get(height)? {
+            Some(guard) => guard.value(),
+            None => return Ok(None),
+        };
+
+        let primary = match read_txn.open_table(PRIMARY) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        Ok(primary.get((101u8, id))?.map(|guard| guard.value().to_vec()))
+    }
 }
 
 #[cfg(test)]
@@ -877,5 +901,48 @@ mod tests {
 
         // PRIMARY data still accessible
         assert_eq!(store.get(101, &test_id(1)).unwrap(), Some(b"data1".to_vec()));
+    }
+
+    // --- read_header_at: height-indexed best-chain header bytes ---
+
+    #[test]
+    fn read_header_at_returns_stored_header_bytes() {
+        let (store, _dir) = test_store();
+        let id = test_id(1);
+        let data = b"header bytes";
+
+        store.put_batch(&[(101, id, 42, data.to_vec())]).unwrap();
+
+        assert_eq!(store.read_header_at(42).unwrap(), Some(data.to_vec()));
+    }
+
+    #[test]
+    fn read_header_at_returns_none_for_empty_height() {
+        let (store, _dir) = test_store();
+        assert_eq!(store.read_header_at(42).unwrap(), None);
+    }
+
+    #[test]
+    fn read_header_at_follows_main_chain_after_reorg_overwrite() {
+        // A fork-first arrival writes into BEST_CHAIN via put_header's
+        // "slot empty" guard. When the main-chain header for the same
+        // height lands via put_batch, BEST_CHAIN is unconditionally
+        // overwritten. read_header_at must return the main-chain bytes,
+        // not the fork bytes.
+        let (store, _dir) = test_store();
+        let fork_id = test_id(0xF0);
+        let main_id = test_id(0x01);
+
+        store
+            .put_header(&fork_id, 100, 1, &[0x99], b"fork bytes")
+            .unwrap();
+        store
+            .put_batch(&[(101, main_id, 100, b"main bytes".to_vec())])
+            .unwrap();
+
+        assert_eq!(
+            store.read_header_at(100).unwrap(),
+            Some(b"main bytes".to_vec())
+        );
     }
 }
