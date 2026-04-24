@@ -1,5 +1,5 @@
 use crate::ModifierStore;
-use ::redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use ::redb::{Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
 use parking_lot::RwLock;
@@ -231,7 +231,16 @@ impl ModifierStore for RedbModifierStore {
         &self,
         entries: &[(u8, [u8; 32], u32, Vec<u8>)],
     ) -> Result<(), Self::Error> {
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        // Redb defaults to Durability::Immediate (fsync every commit). A
+        // put_batch per block section saturates the disk's fsync budget on
+        // encrypted/rotational storage. Skip fsync here; the sync loop
+        // pairs `ModifierStore::flush` with state-storage flushes to bound
+        // crash-recovery work. `set_durability` only fails if called after
+        // writes — we call it on a fresh transaction, so this is infallible.
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
         let mut new_best_tip: Option<(u32, [u8; 32])> = None;
         {
             let mut primary = write_txn.open_table(PRIMARY)?;
@@ -362,7 +371,12 @@ impl ModifierStore for RedbModifierStore {
         score: &[u8],
         data: &[u8],
     ) -> Result<(), Self::Error> {
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        // See `put_batch` — skip fsync; durability is enforced by explicit
+        // `flush()` paired with state-storage flushes.
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
         {
             let mut primary = write_txn.open_table(PRIMARY)?;
             primary.insert((101u8, *id), data)?;
@@ -470,6 +484,18 @@ impl ModifierStore for RedbModifierStore {
             Err(e) => return Err(StoreError::Table(e)),
         };
         Ok(primary.get((101u8, id))?.map(|guard| guard.value().to_vec()))
+    }
+
+    /// Empty write transaction committed with `Durability::Immediate` to
+    /// fsync all prior `Durability::None` commits still held in the page
+    /// cache. Mirrors the pattern used by the state-storage crate.
+    fn flush(&self) -> Result<(), Self::Error> {
+        let mut write_txn = self.db.begin_write()?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .expect("set_durability on fresh txn");
+        write_txn.commit()?;
+        Ok(())
     }
 }
 

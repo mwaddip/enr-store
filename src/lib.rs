@@ -100,4 +100,16 @@ pub trait ModifierStore: Send + Sync {
         &self,
         height: u32,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Force a durable commit — fsync all pending writes to disk.
+    ///
+    /// `put` / `put_batch` / `put_header` use `Durability::None` so normal
+    /// commits skip fsync and batch through the OS page cache. Without an
+    /// fsync, the redb commit pointer is not guaranteed to be on disk when
+    /// the process exits — a SIGTERM that skips destructors can leave the
+    /// store appearing empty on reopen. Call this periodically during
+    /// long-running writes (e.g. paired with state-storage flushes in the
+    /// sync loop) and on graceful shutdown to bound worst-case data loss
+    /// to the interval between flushes.
+    fn flush(&self) -> Result<(), Self::Error>;
 }
